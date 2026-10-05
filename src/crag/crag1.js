@@ -142,7 +142,7 @@ const queryRewriterNode = async function (state) {
 
   const questions = result?.questions;
 
-  if (state.rewriteQueries.length === 3) return { nextNode: "generatorNode" };
+  if (state.rewriteQueries.length === 2) return { nextNode: "generatorNode" };
 
   return { nextNode: "retrieverNode", rewriteQueries: [...questions] };
 };

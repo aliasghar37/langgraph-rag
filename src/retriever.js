@@ -20,7 +20,7 @@ export async function retriever(query) {
     maxConcurrency: 5,
   });
 
-  const result = await vectorStore.similaritySearch(query, 5);
+  const result = await vectorStore.similaritySearch(query, 3);
 
   return result;
 }

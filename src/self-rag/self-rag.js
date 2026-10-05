@@ -1,24 +1,31 @@
 import {
-  START,
   END,
+  START,
   StateGraph,
   Annotation,
   MessagesAnnotation,
 } from "@langchain/langgraph";
-import { createAgent, tool } from "langchain";
+import { createAgent } from "langchain";
 import { z } from "zod";
-import { AIMessage, HumanMessage } from "langchain";
-import { retriever } from "./../retriever.js";
 import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+} from "@langchain/core/messages";
+import { Document } from "@langchain/core/documents";
+
+import {
+  HALLUCINATION_CHECKER_PROMPT,
   QUERY_REWRITE_PROMPT,
+  GRADE_SYSTEM_PROMPT,
   SYNTENSIS_RESPONSE_PROMPT,
   CATEGORIZATION_SYSTEM_PROMPT,
-  GRADE_SYSTEM_PROMPT,
 } from "./prompts.js";
+import { retriever } from "./../retriever.js";
+import { tool } from "@langchain/core/tools";
 import { ChatCerebras } from "@langchain/cerebras";
-import Exa from "exa-js";
 import { ExaSearchResults } from "@langchain/exa";
-import { Document } from "@langchain/core/documents";
+import Exa from "exa-js";
 import "dotenv/config";
 
 const model = new ChatCerebras({
@@ -45,9 +52,10 @@ const StateAnnotation = Annotation.Root({
     reducer: (_, y) => y,
     default: () => [],
   }),
+  generatedAnswer: Annotation({
+    default: () => null,
+  }),
 });
-
-// Nodes
 
 const queryAnalysisNode = async function (state) {
   console.log("queryAnalysisNode::::::::");
@@ -125,12 +133,12 @@ const generatorNode = async function (state) {
         <retrieved_data>
         ${retrievedDocToString}
         </retrieved_data>
-           `,
+        `,
       }),
     ],
   });
   const aiResponse = agentOutput.messages.at(-1);
-  return { messages: [aiResponse] };
+  return { generatedAnswer: aiResponse, messages: [aiResponse] };
 };
 
 const outOfScopeNode = async function (state) {
@@ -220,7 +228,44 @@ const webSearchNode = async function (state) {
   return { retrievedDocuments: [docs] };
 };
 
+const hallucinationChecker = async function (state) {
+  console.log("Hallucination Checker::::::::");
+  const structuredLlm = model.withStructuredOutput(
+    z.object({
+      hallucination: z.enum(["yes", "no"]),
+    }),
+  );
+
+  const result = await structuredLlm.invoke([
+    {
+      role: "ai",
+      content: HALLUCINATION_CHECKER_PROMPT,
+    },
+    {
+      role: "user",
+      content: `
+      User Question:
+      <user_questions>
+        ${state.rewriteQueries.join("\n")}
+      </user_questions>
+            
+      Generated Answer:
+      <generated_answer>
+        ${state.generatedAnswer}
+      </generated_answer>
+      `,
+    },
+  ]);
+  const res = result?.hallucination;
+  if (res === "yes") {
+    console.log("....rewrite....");
+    return { nextNode: "QUERY_REWRITE" };
+  }
+  if (res === "no") return { nextNode: "END" };
+};
+
 // GRAPH
+
 const builder = new StateGraph(StateAnnotation)
   .addNode("queryAnalysisNode", queryAnalysisNode)
   .addNode("queryRewriterNode", queryRewriterNode)
@@ -229,6 +274,7 @@ const builder = new StateGraph(StateAnnotation)
   .addNode("generatorNode", generatorNode)
   .addNode("outOfScopeNode", outOfScopeNode)
   .addNode("webSearchNode", webSearchNode)
+  .addNode("hallucinationChecker", hallucinationChecker)
 
   .addEdge(START, "queryAnalysisNode")
   .addConditionalEdges("queryAnalysisNode", (state) => state.nextNode, {
@@ -247,15 +293,21 @@ const builder = new StateGraph(StateAnnotation)
     generatorNode: "generatorNode",
   })
 
+  .addConditionalEdges("hallucinationChecker", (state) => state.nextNode, {
+    QUERY_REWRITE: "queryRewriterNode",
+    END: END,
+  })
+
   .addEdge("webSearchNode", "generatorNode")
-  .addEdge("generatorNode", END)
+  .addEdge("generatorNode", "hallucinationChecker")
   .addEdge("outOfScopeNode", END);
 
 const graph = builder.compile();
+
 const result = await graph.invoke({
-  // messages: [new HumanMessage({ content: "What is Verbalized Sampling?" })],
   messages: [new HumanMessage({ content: "What is corrective rag?" })],
 });
 
-console.log("FINAL RESPONSE:-------> ", result);
+// console.log("FINAL RESPONSE::::::::}> ", result);
+console.log("FINAL RESPONSE::::::::}> ", result.generatedAnswer.content);
 console.log(graph.getGraph().drawMermaid());
