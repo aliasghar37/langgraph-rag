@@ -13,8 +13,10 @@ import {
   QUERY_REWRITE_PROMPT,
   SYNTENSIS_RESPONSE_PROMPT,
   CATEGORIZATION_SYSTEM_PROMPT,
+  GRADE_SYSTEM_PROMPT,
 } from "./prompts.js";
 import { ChatCerebras } from "@langchain/cerebras";
+// import { ChatOpenAI } from "@langchain/openai";
 import "dotenv/config";
 
 const model = new ChatCerebras({
@@ -22,6 +24,16 @@ const model = new ChatCerebras({
   temperature: 0.7,
   apiKey: process.env.CEREBRAS_API_KEY,
 });
+
+// const jevModel = new ChatOpenAI({
+//   model: "jev-1.13-free",
+//   temperature: 0.7,
+//   apiKey: process.env.BEATAPI_API_KEY,
+// });
+
+const formatDocumentsAsString = (documents) => {
+  return documents.map((doc) => doc?.pageContent).join("\n\n");
+};
 
 // State
 const StateAnnotation = Annotation.Root({
@@ -34,21 +46,18 @@ const StateAnnotation = Annotation.Root({
     default: () => null,
   }),
   retrievedDocuments: Annotation({
-    reducer: (x, y) => x.concat(y),
+    reducer: (_, y) => y,
     default: () => [],
   }),
 });
 
-const formatDocumentsAsString = (documents) => {
-  return documents.map((doc) => doc?.pageContent).join("\n\n");
-};
-
-// NOde functions
+// Nodes
 
 const queryAnalysisNode = async function (state) {
   console.log("queryAnalysisNode::::::::");
   const messageHistory = state.messages;
 
+  // ::::::::::::::::::::::::: LLM Approach
   const structuredModel = model.withStructuredOutput(
     z
       .object({
@@ -66,6 +75,53 @@ const queryAnalysisNode = async function (state) {
   ]);
 
   return { nextNode: result.nextNode };
+
+  // ::::::::::::::::::::::::: JEV APPROACH
+  /*
+  const lastHumanMessage = messageHistory
+    .filter((message) => message._getType() === "human")
+    .at(-1);
+
+  const response = await fetch("https://api.beatapi.io/v1/systemone", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.BEATAPI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "jev-1.13-free",
+      state: {
+        user_question: lastHumanMessage?.content,
+      },
+      questions: {
+        routing: {
+          type: "choice",
+          instructions: CATEGORIZATION_SYSTEM_PROMPT,
+          criteria: {
+            QUERY_REWRITE:
+              "The user's question is relevant to the supported subject area and should be processed by the RAG pipeline.",
+            OUT_OF_SCOPE:
+              "The user's question is unrelated to the supported subject area and should not be processed by the RAG pipeline.",
+          },
+        },
+      },
+    }),
+  });
+
+  if (!response.ok)
+    throw new Error(
+      `BeatAPI request failed: ${response.status} ${response.statusText}`,
+    );
+
+  const result = await response.json();
+  const nextNode = result?.answers?.routing?.choice;
+
+  if (!["QUERY_REWRITE", "OUT_OF_SCOPE"].includes(nextNode))
+    throw new Error(`Invalid Jev routing result: ${nextNode}`);
+
+  console.log("JEV DECISION::::::::::: ", nextNode);
+  return { nextNode };
+  */
 };
 
 const queryRewriterNode = async function (state) {
@@ -76,7 +132,7 @@ const queryRewriterNode = async function (state) {
 
   const structuredLlm = model.withStructuredOutput(
     z
-      .object({ questions: z.array(z.string()).length(3) })
+      .object({ questions: z.array(z.string()).length(1) })
       .describe("rewrite queries"),
   );
   const result = await structuredLlm.invoke([
@@ -86,18 +142,17 @@ const queryRewriterNode = async function (state) {
 
   const questions = result?.questions;
 
+  if (state.rewriteQueries.length === 3) return { nextNode: "generatorNode" };
+
   return { nextNode: "retrieverNode", rewriteQueries: [...questions] };
 };
 
 const retrieverNode = async function (state) {
   console.log("retrieverNode::::::::");
-  const retreivedDocs = [];
-  for (const query of state.rewriteQueries) {
-    const docs = await retriever(query);
-    retreivedDocs.push(docs);
-  }
-  const flatten = retreivedDocs.flat();
-  return { nextNode: "generatorNode", retrievedDocuments: [...flatten] };
+  const query = state.rewriteQueries.at(-1);
+  const documents = await retriever(query);
+
+  return { nextNode: "generatorNode", retrievedDocuments: documents };
 };
 
 const generatorNode = async function (state) {
@@ -125,8 +180,6 @@ const generatorNode = async function (state) {
     ],
   });
   const aiResponse = agentOutput.messages.at(-1);
-
-  // console.log("FINAL RESPONSE:-------> ", aiResponse?.content);
   return { messages: [aiResponse] };
 };
 
@@ -138,12 +191,48 @@ const outOfScopeNode = async function (state) {
   return { messages: [aiResponse] };
 };
 
-// GRAPH
+const graderNode = async function (state) {
+  console.log("graderNode::::::::");
+  const structuredLlm = model.withStructuredOutput(
+    z.object({
+      binaryScore: z
+        .enum(["yes", "no"])
+        .describe("Relevance score 'yes' or 'no'"),
+    }),
+  );
 
+  const formatDocsToString = formatDocumentsAsString(state.retrievedDocuments);
+
+  const result = await structuredLlm.invoke([
+    { role: "ai", content: GRADE_SYSTEM_PROMPT },
+    {
+      role: "human",
+      content: `
+        User Question: 
+        <user_question>
+        ${state.rewriteQueries.join("\n")}
+        </user_question>
+        
+        Retrieved Date:
+        <retrieved_data>
+        ${formatDocsToString}
+        </retrieved_data>
+        `,
+    },
+  ]);
+  const score = result?.binaryScore;
+  console.log("graderNode Score:::::::: ", score);
+
+  if (score === "yes") return { nextNode: "generatorNode" };
+  return { nextNode: "queryRewriterNode" };
+};
+
+// GRAPH
 const builder = new StateGraph(StateAnnotation)
   .addNode("queryAnalysisNode", queryAnalysisNode)
   .addNode("queryRewriterNode", queryRewriterNode)
   .addNode("retrieverNode", retrieverNode)
+  .addNode("graderNode", graderNode)
   .addNode("generatorNode", generatorNode)
   .addNode("outOfScopeNode", outOfScopeNode)
 
@@ -152,24 +241,23 @@ const builder = new StateGraph(StateAnnotation)
     QUERY_REWRITE: "queryRewriterNode",
     OUT_OF_SCOPE: "outOfScopeNode",
   })
-  .addConditionalEdges(
-    "queryRewriterNode",
-    (state) => {
-      return state.nextNode === "retrieverNode" ? "RETRIEVE" : "STOP";
-    },
-    {
-      RETRIEVE: "retrieverNode",
-      STOP: END,
-    },
-  )
-  .addEdge("retrieverNode", "generatorNode")
+  .addConditionalEdges("queryRewriterNode", (state) => state.nextNode, {
+    retrieverNode: "retrieverNode",
+    generatorNode: "generatorNode",
+  })
+  .addEdge("retrieverNode", "graderNode")
+  .addConditionalEdges("graderNode", (state) => state.nextNode, {
+    queryRewriterNode: "queryRewriterNode",
+    generatorNode: "generatorNode",
+  })
+
   .addEdge("generatorNode", END)
   .addEdge("outOfScopeNode", END);
 
 const graph = builder.compile();
-
 const result = await graph.invoke({
-  messages: [new HumanMessage({ content: "What is prompt engineering" })],
+  messages: [new HumanMessage({ content: "What is chain of thoughts?" })],
+  // messages: [new HumanMessage({ content: "What is corrective rag?" })],
 });
 
 console.log("FINAL RESPONSE:-------> ", result);
